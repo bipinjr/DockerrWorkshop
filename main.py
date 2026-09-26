@@ -1,52 +1,117 @@
 """
-Agent web service — exposes the weather tool via a FastAPI HTTP endpoint.
-Designed to run inside the Docker container on port 8000.
+Agent service — Groq LLM backed via LangChain, exposed as a FastAPI REST API.
+Reads GROQ_API_KEY from .env (never committed). Serves on port 8000.
 """
 import os
+from contextlib import asynccontextmanager
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
-from langchain_core.tools import tool
 
 load_dotenv()
 
-# ---------- Tool definition (same as TestAPII.py) ----------
-class WeatherInput(BaseModel):
-    city: str = Field(description="Name of the city to get weather for")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.groq.com/openai/v1")
 
-@tool("get_weather", args_schema=WeatherInput)
-def get_weather(city: str) -> str:
-    """
-    Returns the current weather for a given city.
-    Use this tool when the user asks about weather conditions.
-    """
-    if not city or not city.strip():
-        raise ValueError("City name must be a non-empty string")
-    api_key = os.getenv("WEATHER_API_KEY")
-    if not api_key:
-        raise ValueError("WEATHER_API_KEY not set in environment")
-    # ... real API call would go here ...
-    return f"Weather in {city}: 28°C, Sunny"
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY not set. Copy .env.example to .env and add your key."
+    )
 
-# ---------- FastAPI app ----------
-app = FastAPI(title="Agent Tool Service", version="1.0.0")
+# ---------- LLM setup (Groq via OpenAI-compatible endpoint) ----------
+llm = ChatOpenAI(
+    api_key=GROQ_API_KEY,
+    base_url=OPENAI_API_BASE,
+    model="qwen/qwen3.8-27b",
+    temperature=0.7,
+    timeout=30,
+)
 
-class WeatherRequest(BaseModel):
-    city: str = Field(description="Name of the city to get weather for")
+MODEL_NAME = llm.model_name
+
+# ---------- Input / output schemas ----------
+class AgentRequest(BaseModel):
+    message: str = Field(..., description="User message to send to the agent")
+
+class AgentResponse(BaseModel):
+    message: str
+    model: str
+    usage: dict = {}
+
+
+# ---------- System prompt ----------
+SYSTEM_PROMPT = (
+    "You are a helpful, concise assistant. You are running as a deployed agent "
+    "service behind a REST API. Give clear, direct answers. If the user asks "
+    "about the service itself, explain that it is a LangChain + FastAPI agent "
+    "backed by Groq, containerized with Docker, and deployable to Render or Railway."
+)
+
+
+# ---------- App lifecycle ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Health check on startup
+    try:
+        llm.invoke([HumanMessage(content="ping")])
+        app.state.healthy = True
+    except Exception as exc:
+        app.state.healthy = False
+        print(f"LLM ping failed on startup: {exc}")
+    yield
+
+
+app = FastAPI(
+    title="Agent Service",
+    description="LangChain agent backed by Groq, served over HTTP",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
 
 @app.get("/")
-def health_check():
-    """Health check endpoint — returns 200 OK when the container is running."""
-    return {"status": "ok", "service": "agent-tool-service"}
+def health():
+    healthy = getattr(app.state, "healthy", None)
+    return {
+        "status": "ok" if healthy else "degraded",
+        "service": "agent-service",
+        "model": MODEL_NAME,
+        "backend": "groq",
+    }
 
-@app.post("/weather")
-def weather_endpoint(req: WeatherRequest):
-    """Call the weather tool and return its output."""
+
+@app.post("/agent", response_model=AgentResponse)
+def agent_endpoint(req: AgentRequest):
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="message must be non-empty")
+
     try:
-        result = get_weather.invoke({"city": req.city})
-        return {"city": req.city, "weather": result}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=req.message),
+        ]
+        response = llm.invoke(messages)
+        return AgentResponse(
+            message=response.content,
+            model=MODEL_NAME,
+            usage={},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {exc}")
+
+
+@app.get("/health")
+def detailed_health():
+    return {
+        "service": "agent-service",
+        "model": MODEL_NAME,
+        "backend": "groq",
+        "api_key_set": bool(GROQ_API_KEY),
+        "healthy": getattr(app.state, "healthy", None),
+    }
 
 
 if __name__ == "__main__":
